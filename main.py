@@ -47,65 +47,123 @@ def compute_edit_until(template: dict, target_date) -> datetime | None:
     return datetime(edit_date.year, edit_date.month, edit_date.day, hour, minute)
 
 
-def resolve_product_id_normal(template: dict) -> str | None:
-    """Dla zwykłych template’ów (type != 'iconic') bierzemy po prostu pid."""
-    return template.get("pid")
+# --- RESOLVER PRODUKTÓW ---
 
 
-def resolve_product_id_iconic(template: dict, target_date_str: str, menus_collection) -> str | None:
-    """
-    Szuka produktu na podstawie:
-    - template.iconicMenuId -> dokument z kolekcji menus
-    - w menu.days znajdujemy rekord z date == target_date_str
-    - w tym dniu szukamy w iconicLinks pozycji z iconicId == template.idd
-    - zwracamy link.productId
-    """
+def resolve_product_ids_normal(template: dict) -> list[str]:
+    """Dla zwykłych template’ów (type != 'iconic') bierzemy po prostu pid jako jeden produkt."""
+    pid = template.get("pid")
+    return [pid] if pid else []
 
-    menu_id = template.get("idd")
-    if not menu_id:
-        return None
 
-    # menu_id może być stringiem lub ObjectId
-    if isinstance(menu_id, str):
+def _to_object_id(maybe_id):
+    """Pomocniczo: zamień string na ObjectId, jeśli się da, w przeciwnym razie zwróć oryginał."""
+    if isinstance(maybe_id, str):
         try:
-            menu_id = ObjectId(menu_id)
+            return ObjectId(maybe_id)
         except Exception:
-            pass
+            return maybe_id
+    return maybe_id
 
+
+def resolve_product_ids_iconic(
+    template: dict,
+    target_date_str: str,
+    menus_collection,
+    product_sets_collection,
+) -> list[str]:
+    """
+    Szuka produktu(ów) na podstawie:
+    - template.ppid -> dokument z kolekcji menus (dynamiczne menu)
+    - w menu.days znajdujemy rekord z date == target_date_str
+    - w tym dniu szukamy w iconicLinks pozycji z iconicId == template.iconicMenuId
+    - jeśli link ma productId -> zwracamy [productId]
+    - jeśli link ma productSetId -> pobieramy product_set i zwracamy listę productId z tego seta
+    """
+
+    # ppid = id dynamicznego menu
+    menu_id = template.get("ppid")
+    if not menu_id:
+        return []
+
+    menu_id = _to_object_id(menu_id)
     menu = menus_collection.find_one({"_id": menu_id})
     if not menu:
-        return None
+        return []
 
+    # znajdź odpowiedni dzień
     day_entry = None
     for day in menu.get("days", []):
         if day.get("date") == target_date_str:
             day_entry = day
             break
+
     if not day_entry:
-        return None
+        return []
 
+    # iconicMenuId = id produktu dynamicznego (slotu ikonicznego) w tym menu
     iconic_id = template.get("iconicMenuId")
-    print(iconic_id)
     if not iconic_id:
-        return None
+        return []
 
-    for link in day_entry.get("iconicLinks", []):
-        if link.get("iconicId") == iconic_id:
-            product_id = link.get("productId")
-            if product_id:
-                return product_id
+    # znajdź link dla danego slotu
+    link = None
+    for l in day_entry.get("iconicLinks", []):
+        if l.get("iconicId") == iconic_id:
+            link = l
+            break
 
-    return None
+    if not link:
+        return []
+
+    # 1) prosty przypadek – podpięty bezpośrednio produkt
+    product_id = link.get("productId")
+    if product_id:
+        return [product_id]
+
+    # 2) przypadek seta – podpięty set, trzeba go rozwinąć na produkty
+    product_set_id = (
+        link.get("productSetId")
+        or link.get("productSetID")
+        or link.get("product_set_id")
+    )
+    if not product_set_id:
+        return []
+
+    product_set_id = _to_object_id(product_set_id)
+    product_set = product_sets_collection.find_one({"_id": product_set_id})
+    if not product_set:
+        return []
+
+    product_ids: list[str] = []
+    # zakładam strukturę: product_set["elements"] = [{ "productId": ... }, ...]
+    for el in product_set.get("elements", []):
+        pid = el.get("productId")
+        if pid:
+            product_ids.append(pid)
+
+    return product_ids
 
 
-def resolve_product_id(template: dict, target_date_str: str, menus_collection) -> str | None:
+def resolve_product_ids(
+    template: dict,
+    target_date_str: str,
+    menus_collection,
+    product_sets_collection,
+) -> list[str]:
     """
     Wybiera odpowiednią metodę w zależności od typu template’a.
+    Zwraca listę productId (może być 0, 1 lub wiele – np. gdy set).
     """
     if template.get("type") == "iconic":
-        return resolve_product_id_iconic(template, target_date_str, menus_collection)
+        return resolve_product_ids_iconic(
+            template, target_date_str, menus_collection, product_sets_collection
+        )
     else:
-        return resolve_product_id_normal(template)
+        return resolve_product_ids_normal(template)
+
+
+# --- GŁÓWNA FUNKCJA ---
 
 
 def generate_orders():
@@ -115,6 +173,7 @@ def generate_orders():
     orders_collection = db["orders"]
     templates_collection = db["order_templates"]
     menus_collection = db["menus"]
+    product_sets_collection = db["product_sets"]
 
     # data, na którą generujemy zamówienia (dziś + DAYS_OFFSET)
     today = datetime.utcnow().date()
@@ -135,16 +194,12 @@ def generate_orders():
 
         uid = tpl["uid"]
 
-        product_id = resolve_product_id(tpl, target_date_str, menus_collection)
-        if not product_id:
-            print(f"[WARN] Nie znaleziono productId dla template {tpl['_id']} na {target_date_str}")
+        product_ids = resolve_product_ids(
+            tpl, target_date_str, menus_collection, product_sets_collection
+        )
+        if not product_ids:
+            print(f"[WARN] Nie znaleziono productId(ów) dla template {tpl['_id']} na {target_date_str}")
             continue
-
-        item = {
-            "productId": product_id,
-            "quantity": qty,
-            "templateId": tpl["_id"],
-        }
 
         if uid not in orders_by_uid:
             orders_by_uid[uid] = {
@@ -154,7 +209,14 @@ def generate_orders():
                 "editUntil": None,
             }
 
-        orders_by_uid[uid]["items"].append(item)
+        # jeśli to set, dodajemy kilka produktów; każdy z tą samą ilością qty
+        for pid in product_ids:
+            item = {
+                "productId": pid,
+                "quantity": qty,
+                "templateId": tpl["_id"],
+            }
+            orders_by_uid[uid]["items"].append(item)
 
         # policz editUntil i weź najwcześniejszy dla danego usera
         edit_until_tpl = compute_edit_until(tpl, target_date)
