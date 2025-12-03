@@ -98,9 +98,9 @@ def resolve_product_ids_iconic(
 ) -> list[str]:
     """
     Szuka KONKRETNEGO produktu (jednego) na podstawie:
-    - template.ppid         -> _id dynamicznego menu (kolekcja menus)
-    - w menu.days           -> dzień z date == target_date_str
-    - template.iconicMenuId -> iconicId w iconicLinks
+    - template.idd / ppid    -> _id dynamicznego menu (kolekcja menus)
+    - w menu.days            -> dzień z date == target_date_str
+    - template.iconicMenuId  -> iconicId w iconicLinks
 
     iconicLinks: [{ iconicId, productId }, ...]
     product_sets: mają productIds – jeden z nich może być podlinkowany
@@ -109,8 +109,8 @@ def resolve_product_ids_iconic(
     Zwraca listę z jednym productId (albo pustą listę, jeśli nie znaleziono).
     """
 
-    # 1. dynamiczne menu
-    menu_id = template.get("ppid")
+    # 1. dynamiczne menu (priorytet: ppid, ale w Twoich danych jest idd)
+    menu_id = template.get("ppid") or template.get("idd")
     if not menu_id:
         return []
 
@@ -146,7 +146,7 @@ def resolve_product_ids_iconic(
             if link.get("iconicId") == iconic_id:
                 pid = link.get("productId")
                 if pid:
-                    # opcjonalnie: upewnij się, że ten produkt jest naprawdę na tym dniu menu
+                    # upewnij się, że ten produkt jest naprawdę na tym dniu menu
                     if not products_for_day or pid in products_for_day:
                         return [pid]
 
