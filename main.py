@@ -25,26 +25,50 @@ def get_quantity_for_date(template: dict, target_date) -> int:
     return int(template.get(field_name, 0) or 0)
 
 
+def js_to_py_weekday(js_day: int) -> int:
+    """
+    Zamiana numeru dnia tygodnia z JS (0=nd, 6=sb)
+    na numer używany przez Pythona (0=pn, 6=nd).
+    """
+    return (js_day + 6) % 7
+
+
 def compute_edit_until(template: dict, target_date) -> datetime | None:
     """
-    Oblicza editUntil na podstawie pól:
-    - deadDays: [liczba_dni_przed]
-    - deadline: [godzina, minuta]
+    Oblicza editUntil w oparciu o:
+    - deadline: [dni_przed, godzina, (opcjonalnie minuta)]
+      np. [2, 12] = 2 dni ROBOCZE wcześniej do godziny 12:00
+    - deadDays: lista dni tygodnia (JS: 0=nd, 6=sb), które
+      NIE są liczone jako dni do deadlinu.
 
-    target_date: datetime.date (dzień zamówienia)
+    target_date: datetime.date – dzień realizacji zamówienia.
     """
-    dead_days = template.get("deadDays") or []
-    deadline = template.get("deadline") or []
 
-    if not dead_days and not deadline:
+    deadline = template.get("deadline") or []
+    dead_days_js = template.get("deadDays") or []
+
+    if not deadline:
         return None
 
-    days_before = int(dead_days[0]) if dead_days else 0
-    hour = int(deadline[0]) if len(deadline) > 0 else 0
-    minute = int(deadline[1]) if len(deadline) > 1 else 0
+    # ile dni roboczych wcześniej można odwołać
+    days_before = int(deadline[0]) if len(deadline) > 0 else 0
+    hour = int(deadline[1]) if len(deadline) > 1 else 0
+    minute = int(deadline[2]) if len(deadline) > 2 else 0
 
-    edit_date = target_date - timedelta(days=days_before)
-    return datetime(edit_date.year, edit_date.month, edit_date.day, hour, minute)
+    # zamiana deadDays z JS na indeksy Pythona
+    dead_days_py = {js_to_py_weekday(int(d)) for d in dead_days_js}
+
+    d = target_date
+    remaining = days_before
+
+    # cofamy się o "days_before" dni ROBOCZYCH (pomijając deadDays)
+    while remaining > 0:
+        d -= timedelta(days=1)
+        if d.weekday() not in dead_days_py:
+            remaining -= 1
+
+    # deadline w wyliczonym dniu o podanej godzinie
+    return datetime(d.year, d.month, d.day, hour, minute)
 
 
 # --- RESOLVER PRODUKTÓW ---
@@ -73,15 +97,19 @@ def resolve_product_ids_iconic(
     product_sets_collection,
 ) -> list[str]:
     """
-    Szuka produktu(ów) na podstawie:
-    - template.ppid -> dokument z kolekcji menus (dynamiczne menu)
-    - w menu.days znajdujemy rekord z date == target_date_str
-    - w tym dniu szukamy w iconicLinks pozycji z iconicId == template.iconicMenuId
-    - jeśli link ma productId -> zwracamy [productId]
-    - jeśli link ma productSetId -> pobieramy product_set i zwracamy listę productId z tego seta
+    Szuka KONKRETNEGO produktu (jednego) na podstawie:
+    - template.ppid         -> _id dynamicznego menu (kolekcja menus)
+    - w menu.days           -> dzień z date == target_date_str
+    - template.iconicMenuId -> iconicId w iconicLinks
+
+    iconicLinks: [{ iconicId, productId }, ...]
+    product_sets: mają productIds – jeden z nich może być podlinkowany
+    z iconicProduct przez iconicLinks.productId.
+
+    Zwraca listę z jednym productId (albo pustą listę, jeśli nie znaleziono).
     """
 
-    # ppid = id dynamicznego menu
+    # 1. dynamiczne menu
     menu_id = template.get("ppid")
     if not menu_id:
         return []
@@ -91,7 +119,7 @@ def resolve_product_ids_iconic(
     if not menu:
         return []
 
-    # znajdź odpowiedni dzień
+    # 2. znajdź odpowiedni dzień
     day_entry = None
     for day in menu.get("days", []):
         if day.get("date") == target_date_str:
@@ -101,48 +129,33 @@ def resolve_product_ids_iconic(
     if not day_entry:
         return []
 
-    # iconicMenuId = id produktu dynamicznego (slotu ikonicznego) w tym menu
+    # 3. zbierz wszystkie produkty dostępne danego dnia
+    products_for_day = set(day_entry.get("productIds", []))
+
+    for psid in day_entry.get("productSetIds", []):
+        ps_oid = _to_object_id(psid)
+        product_set = product_sets_collection.find_one({"_id": ps_oid})
+        if product_set:
+            for pid in product_set.get("productIds", []):
+                products_for_day.add(pid)
+
+    # 4. dopasuj slot ikoniczny -> produkt
     iconic_id = template.get("iconicMenuId")
-    if not iconic_id:
-        return []
+    if iconic_id:
+        for link in day_entry.get("iconicLinks", []):
+            if link.get("iconicId") == iconic_id:
+                pid = link.get("productId")
+                if pid:
+                    # opcjonalnie: upewnij się, że ten produkt jest naprawdę na tym dniu menu
+                    if not products_for_day or pid in products_for_day:
+                        return [pid]
 
-    # znajdź link dla danego slotu
-    link = None
-    for l in day_entry.get("iconicLinks", []):
-        if l.get("iconicId") == iconic_id:
-            link = l
-            break
+    # 5. fallback – jeśli nie ma linka, ale w template jest pid
+    pid_from_template = template.get("pid")
+    if pid_from_template and (not products_for_day or pid_from_template in products_for_day):
+        return [pid_from_template]
 
-    if not link:
-        return []
-
-    # 1) prosty przypadek – podpięty bezpośrednio produkt
-    product_id = link.get("productId")
-    if product_id:
-        return [product_id]
-
-    # 2) przypadek seta – podpięty set, trzeba go rozwinąć na produkty
-    product_set_id = (
-        link.get("productSetId")
-        or link.get("productSetID")
-        or link.get("product_set_id")
-    )
-    if not product_set_id:
-        return []
-
-    product_set_id = _to_object_id(product_set_id)
-    product_set = product_sets_collection.find_one({"_id": product_set_id})
-    if not product_set:
-        return []
-
-    product_ids: list[str] = []
-    # zakładam strukturę: product_set["elements"] = [{ "productId": ... }, ...]
-    for el in product_set.get("elements", []):
-        pid = el.get("productId")
-        if pid:
-            product_ids.append(pid)
-
-    return product_ids
+    return []
 
 
 def resolve_product_ids(
@@ -153,7 +166,8 @@ def resolve_product_ids(
 ) -> list[str]:
     """
     Wybiera odpowiednią metodę w zależności od typu template’a.
-    Zwraca listę productId (może być 0, 1 lub wiele – np. gdy set).
+    Zwraca listę productId (może być 0, 1 lub wiele – ale w ikonicznym
+    przypadku i tak będzie 1).
     """
     if template.get("type") == "iconic":
         return resolve_product_ids_iconic(
@@ -198,7 +212,9 @@ def generate_orders():
             tpl, target_date_str, menus_collection, product_sets_collection
         )
         if not product_ids:
-            print(f"[WARN] Nie znaleziono productId(ów) dla template {tpl['_id']} na {target_date_str}")
+            print(
+                f"[WARN] Nie znaleziono productId(ów) dla template {tpl['_id']} na {target_date_str}"
+            )
             continue
 
         if uid not in orders_by_uid:
@@ -209,7 +225,7 @@ def generate_orders():
                 "editUntil": None,
             }
 
-        # jeśli to set, dodajemy kilka produktów; każdy z tą samą ilością qty
+        # dodajemy każdy produkt (dla seta będzie też 1 productId – ten z iconicLinks)
         for pid in product_ids:
             item = {
                 "productId": pid,
