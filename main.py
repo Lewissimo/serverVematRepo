@@ -243,29 +243,60 @@ def generate_orders():
 
     now = datetime.utcnow()
 
-    # zapis / upsert do kolekcji orders
+    # zapis / MERGE do kolekcji orders
     for uid, order_data in orders_by_uid.items():
         query = {"uid": uid, "date": order_data["date"]}
-        update = {
-            "$set": {
+        existing = orders_collection.find_one(query)
+
+        if existing:
+            # --- MERGE: dodajemy ilości dla tych samych productId ---
+            existing_items = existing.get("items", [])
+            for new_item in order_data["items"]:
+                pid = new_item["productId"]
+                match = next(
+                    (it for it in existing_items if it.get("productId") == pid),
+                    None,
+                )
+                if match:
+                    # dodaj ilość
+                    match["quantity"] = int(match.get("quantity", 0)) + int(
+                        new_item["quantity"]
+                    )
+                else:
+                    # nowy produkt w tym zamówieniu
+                    existing_items.append(new_item)
+
+            # editUntil = najwcześniejsza z obecnej i nowej
+            new_edit = order_data["editUntil"]
+            old_edit = existing.get("editUntil")
+            if new_edit and old_edit:
+                final_edit = min(new_edit, old_edit)
+            else:
+                final_edit = new_edit or old_edit
+
+            update = {
+                "$set": {
+                    "items": existing_items,
+                    "editUntil": final_edit,
+                    "updatedAt": now,
+                }
+            }
+
+            orders_collection.update_one({"_id": existing["_id"]}, update)
+            print(f"[UPDATE] (merge) order dla usera {uid}")
+        else:
+            # --- nowy dokument ---
+            doc = {
                 "uid": uid,
                 "date": order_data["date"],
                 "items": order_data["items"],
                 "status": "new",
                 "editUntil": order_data["editUntil"],
-                "updatedAt": now,
-            },
-            "$setOnInsert": {
                 "createdAt": now,
-            },
-        }
-
-        result = orders_collection.update_one(query, update, upsert=True)
-
-        if result.upserted_id:
-            print(f"[INSERT] order {result.upserted_id} dla usera {uid}")
-        else:
-            print(f"[UPDATE] order dla usera {uid}")
+                "updatedAt": now,
+            }
+            result = orders_collection.insert_one(doc)
+            print(f"[INSERT] order {result.inserted_id} dla usera {uid}")
 
     client.close()
     print("Gotowe.")
