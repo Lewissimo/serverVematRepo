@@ -85,6 +85,7 @@ def resolve_product_id_iconic(template: dict, target_date_str: str, menus_collec
         return None
 
     iconic_id = template.get("iconicMenuId")
+    print(iconic_id)
     if not iconic_id:
         return None
 
