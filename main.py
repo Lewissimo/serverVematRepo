@@ -60,7 +60,10 @@ def resolve_product_id_iconic(template: dict, target_date_str: str, menus_collec
     - w tym dniu szukamy w iconicLinks pozycji z iconicId == template.idd
     - zwracamy link.productId
     """
-    menu_id = template.get("iconicMenuId")
+    iconic_product_id = template.get("iconicMenuId")
+    if not iconic_product_id:
+        return None
+    menu_id = template.get("idd")
     if not menu_id:
         return None
 
@@ -80,7 +83,7 @@ def resolve_product_id_iconic(template: dict, target_date_str: str, menus_collec
         if day.get("date") == target_date_str:
             day_entry = day
             break
-
+    print(day_entry)
     if not day_entry:
         return None
 
