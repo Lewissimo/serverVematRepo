@@ -8,7 +8,7 @@ MONGODB_URI = "mongodb+srv://lewinskicoding:Marta6021023@vemataps.21klpmx.mongod
 MONGODB_DB = "miloszapptest"
 
 # ile dni do przodu generujemy zamówienia (np. 7 = poniedziałek za tydzień)
-DAYS_OFFSET = 7
+DAYS_OFFSET = 15
 
 # mapowanie pythonowego weekday() -> nazwy pól w order_templates
 WEEKDAY_FIELDS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
