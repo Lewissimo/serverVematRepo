@@ -109,7 +109,7 @@ def resolve_product_ids_iconic(
     Zwraca listę z jednym productId (albo pustą listę, jeśli nie znaleziono).
     """
 
-    # 1. dynamiczne menu (priorytet: ppid, ale w Twoich danych jest idd)
+    # 1. dynamiczne menu (priorytet: ppid, ale w danych jest idd)
     menu_id = template.get("ppid") or template.get("idd")
     if not menu_id:
         return []
@@ -146,7 +146,6 @@ def resolve_product_ids_iconic(
             if link.get("iconicId") == iconic_id:
                 pid = link.get("productId")
                 if pid:
-                    # upewnij się, że ten produkt jest naprawdę na tym dniu menu
                     if not products_for_day or pid in products_for_day:
                         return [pid]
 
@@ -248,50 +247,58 @@ def generate_orders():
         query = {"uid": uid, "date": order_data["date"]}
         existing = orders_collection.find_one(query)
 
+        # połącz stare itemy z nowymi
+        all_items = []
         if existing:
-            # --- MERGE: dodajemy ilości dla tych samych productId ---
-            existing_items = existing.get("items", [])
-            for new_item in order_data["items"]:
-                pid = new_item["productId"]
-                match = next(
-                    (it for it in existing_items if it.get("productId") == pid),
-                    None,
-                )
-                if match:
-                    # dodaj ilość
-                    match["quantity"] = int(match.get("quantity", 0)) + int(
-                        new_item["quantity"]
-                    )
-                else:
-                    # nowy produkt w tym zamówieniu
-                    existing_items.append(new_item)
+            all_items.extend(existing.get("items", []))
+        all_items.extend(order_data["items"])
 
-            # editUntil = najwcześniejsza z obecnej i nowej
-            new_edit = order_data["editUntil"]
-            old_edit = existing.get("editUntil")
-            if new_edit and old_edit:
-                final_edit = min(new_edit, old_edit)
+        # MERGE po productId – suma quantity
+        merged_by_pid: dict[str, dict] = {}
+        for it in all_items:
+            pid = it.get("productId")
+            if not pid:
+                continue
+            qty = int(it.get("quantity", 0) or 0)
+            if pid not in merged_by_pid:
+                merged_by_pid[pid] = {
+                    "productId": pid,
+                    "quantity": qty,
+                    # bierzemy templateId z „ostatniego” wpisu,
+                    # jak potrzebujesz inaczej, tu można to zmienić
+                    "templateId": it.get("templateId"),
+                }
             else:
-                final_edit = new_edit or old_edit
+                merged_by_pid[pid]["quantity"] += qty
+                merged_by_pid[pid]["templateId"] = it.get("templateId") or merged_by_pid[pid]["templateId"]
 
+        merged_items = list(merged_by_pid.values())
+
+        # editUntil = najwcześniejsza z obecnej i nowej
+        new_edit = order_data["editUntil"]
+        old_edit = existing.get("editUntil") if existing else None
+        if new_edit and old_edit:
+            final_edit = min(new_edit, old_edit)
+        else:
+            final_edit = new_edit or old_edit
+
+        if existing:
             update = {
                 "$set": {
-                    "items": existing_items,
+                    "items": merged_items,
                     "editUntil": final_edit,
                     "updatedAt": now,
                 }
             }
-
             orders_collection.update_one({"_id": existing["_id"]}, update)
             print(f"[UPDATE] (merge) order dla usera {uid}")
         else:
-            # --- nowy dokument ---
             doc = {
                 "uid": uid,
                 "date": order_data["date"],
-                "items": order_data["items"],
+                "items": merged_items,
                 "status": "new",
-                "editUntil": order_data["editUntil"],
+                "editUntil": final_edit,
                 "createdAt": now,
                 "updatedAt": now,
             }
